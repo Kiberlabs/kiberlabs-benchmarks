@@ -10,6 +10,8 @@ Reproducible performance, **50-thread SQLite WAL zero-lock concurrency**, and **
 - **Trust & Architecture Decisions (ADRs):** [kiberlabs.github.io/trust.html](https://kiberlabs.github.io/trust.html)
 - **Interactive Fixed-Price SOW PDF Generator:** [kiberlabs.github.io/sow.html](https://kiberlabs.github.io/sow.html)
 
+
+> **Public Evaluation Sandbox & Scope Note:** This repository contains the open reference core and deterministic `pytest` harness operating on synthetic fixtures (`data/sample_*`) under the [MIT License](LICENSE). Production connectors (live anti-bot scrapers, WhatsApp/Telegram cloud webhooks, ERP/SAP & VIES adapters, and multi-tenant deployment manifests) are maintained in **KiberLabs Private Enterprise Repositories** and delivered under client SOW.
 ---
 
 ## Measured Reference Results (`v0.1.0`)
@@ -51,3 +53,9 @@ kiberlabs-bench --json-out results/benchmark_report.json --md-out BENCHMARK_REPO
 - `src/kiberlabs_bench/security_redteam.py`: 112-payload adversarial attack generator and evaluator across 5 threat classes.
 - `src/kiberlabs_bench/runner.py`: High-resolution (`time.perf_counter_ns`) benchmark harness with exact percentile calculation, 50-thread SQLite WAL stress test, and JSON/Markdown report serialization.
 - `.github/workflows/ci.yml`: Automated CI running on every `push`, `pull_request`, and weekly Monday schedule (`0 6 * * 1`) across Python `3.11` and `3.12`.
+
+---
+
+## License
+
+[MIT](LICENSE) — Built by **KiberLabs Engineering** (*AI & Python Automation Studio*).
