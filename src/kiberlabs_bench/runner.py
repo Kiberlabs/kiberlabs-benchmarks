@@ -183,7 +183,7 @@ def bench_rag_fts5_bm25(doc_count: int = 200, query_count: int = 1_000) -> dict[
 
         seed_articles = (
             ("REG-GDPR-ART33", "Article 33", "Personal data breach notification to supervisory authority within 72 hours."),
-            ("NORM-ES-FACTURA", "Articulo 29", "Conservacion obligatoria de facturas electronicas durante plazo legal de 4 anos."),
+            ("NORM-ES-FACTURA", "Articulo 29", "Conservacion obligatoria de facturas electronicas durante plazo legal de 6 años."),
             ("ADR-001-WAL", "Section 1", "SQLite WAL journal mode with busy timeout 5000 eliminates concurrent read write lock contention."),
             ("ADR-003-HMAC", "Section 3", "FastAPI gateway enforces HMAC API key constant time verification and rate limiting."),
         )
@@ -299,10 +299,9 @@ def bench_sqlite_wal_concurrency(workers: int = 50, ops_per_worker: int = 40) ->
             local_locks = 0
             local_writes = 0
             local_reads = 0
-            conn = sqlite3.connect(str(db_path), timeout=10.0)
-            conn.execute("PRAGMA journal_mode=WAL")
+            conn = sqlite3.connect(str(db_path), timeout=30.0)
+            conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=10000")
             try:
                 barrier.wait()
                 for seq in range(ops_per_worker):

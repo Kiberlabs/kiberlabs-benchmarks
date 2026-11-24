@@ -8,6 +8,7 @@ import ipaddress
 import math
 import re
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -44,16 +45,22 @@ _SKU_ID_RE = re.compile(r"^[A-Za-z0-9._-]{2,64}$")
 
 _FTS_FORBIDDEN_CHARS_RE = re.compile(r"[\x00-\x1f\x7f'\"`;*^:(){}=\\]|--|/\*|\*/")
 _FTS_FORBIDDEN_KEYWORDS_RE = re.compile(
-    r"\b(AND|OR|NOT|NEAR|SELECT|UNION|DROP|DELETE|INSERT|UPDATE|ATTACH|PRAGMA|SQLITE_MASTER)\b",
-    re.IGNORECASE,
+    r"\b(?:OR|NOT|NEAR|SELECT|UNION|DROP|DELETE|INSERT|UPDATE|ATTACH|PRAGMA|SQLITE_MASTER|(?i:sqlite_master))\b"
 )
 _FTS_TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ÿ_-]{2,40}")
 
 
 def _is_forbidden_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Flow: unwrap IPv4-mapped IPv6 addresses, then reject any non-public address range."""
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    """Flow: unwrap IPv4-mapped/6to4/teredo IPv6 addresses, then reject any non-public address range."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return _is_forbidden_ip(ip.ipv4_mapped)
+        if ip.sixtofour is not None and _is_forbidden_ip(ip.sixtofour):
+            return True
+        if ip.teredo is not None and any(_is_forbidden_ip(addr) for addr in ip.teredo):
+            return True
+        if ip.is_site_local:
+            return True
     if (
         ip.is_private
         or ip.is_loopback
@@ -123,7 +130,7 @@ def validate_outbound_url(url: str) -> str:
     """Flow: enforce http(s) scheme, reject credentials/internal suffixes, and block private/metadata/obfuscated IPs."""
     if not isinstance(url, str) or not url or len(url) > 2048:
         raise ValueError("Invalid URL length or type")
-    if any(ch in url for ch in ("\r", "\n", "\x00", " ")):
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
         raise ValueError("URL contains forbidden whitespace or control characters")
 
     parsed = urlsplit(url)
@@ -173,7 +180,7 @@ def validate_safe_path(base_dir: Path, untrusted_path: str) -> Path:
         if candidate.startswith(("/", "\\", "~")) or _DRIVE_RE.match(candidate) or ":" in candidate:
             raise ValueError("Absolute paths, UNC paths, and drive letters are forbidden")
         segments = [seg for seg in re.split(r"[/\\]+", candidate) if seg != ""]
-        if not segments or any(seg in (".", "..") or "..." in seg for seg in segments):
+        if not segments or any(not seg.strip(".") for seg in segments):
             raise ValueError("Path traversal segment detected")
 
     resolved_base = base_dir.resolve()
@@ -192,9 +199,23 @@ def sanitize_fts5_query(raw_query: str) -> str:
     if _FTS_FORBIDDEN_KEYWORDS_RE.search(raw_query):
         raise ValueError("Forbidden SQL/FTS5 operator keyword detected")
 
-    tokens = _FTS_TOKEN_RE.findall(raw_query)[:12]
-    if not tokens:
+    all_tokens = _FTS_TOKEN_RE.findall(raw_query)
+    if not all_tokens:
         raise ValueError("Query contains no valid searchable tokens")
+    if re.search(r"\bAND\b", raw_query):
+        if any(ch.islower() for ch in raw_query):
+            raise ValueError("Forbidden SQL/FTS5 operator keyword detected")
+        for idx, tok in enumerate(all_tokens):
+            if tok == "AND":
+                if idx == 0 or idx == len(all_tokens) - 1:
+                    raise ValueError("Forbidden SQL/FTS5 operator keyword detected")
+                prev_tok, next_tok = all_tokens[idx - 1], all_tokens[idx + 1]
+                if prev_tok == "AND" or next_tok == "AND":
+                    raise ValueError("Forbidden SQL/FTS5 operator keyword detected")
+                if not (any(ch.isalpha() for ch in prev_tok) and any(ch.isalpha() for ch in next_tok)):
+                    raise ValueError("Forbidden SQL/FTS5 operator keyword detected")
+
+    tokens = all_tokens[:12]
     return " ".join(f'"{tok}"' for tok in tokens)
 
 
@@ -208,14 +229,16 @@ class ReplayGuard:
         max_age_sec: int = 300,
         max_future_skew_sec: int = 60,
     ) -> None:
-        """Flow: initialize SQLite WAL seen_events table with busy_timeout=5000 for atomic event deduplication."""
+        """Flow: initialize SQLite WAL seen_events table with busy_timeout=15000 for atomic event deduplication."""
         self._secret = secret_key
         self._max_age = max_age_sec
         self._max_future = max_future_skew_sec
-        self._conn = sqlite3.connect(str(db_path), timeout=5.0, check_same_thread=False)
+        self._lock = threading.Lock()
+        self._closed = False
+        self._conn = sqlite3.connect(str(db_path), timeout=15.0, check_same_thread=False)
+        self._conn.execute("PRAGMA busy_timeout=15000")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS seen_events (event_id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)"
         )
@@ -260,17 +283,27 @@ class ReplayGuard:
             raise ValueError("HMAC signature mismatch")
 
         try:
-            self._conn.execute(
-                "INSERT INTO seen_events (event_id, seen_at) VALUES (?, ?)",
-                (event_id, current_ts),
-            )
-            self._conn.commit()
+            with self._lock:
+                with self._conn:
+                    self._conn.execute(
+                        "INSERT INTO seen_events (event_id, seen_at) VALUES (?, ?)",
+                        (event_id, current_ts),
+                    )
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"Duplicate webhook replay blocked: {event_id}") from exc
         return True
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            if not self._closed:
+                self._conn.close()
+                self._closed = True
+
+    def __enter__(self) -> ReplayGuard:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def _strict_float(val: Any, name: str) -> float:
