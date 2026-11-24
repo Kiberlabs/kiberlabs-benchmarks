@@ -314,6 +314,7 @@ def test_deterministic_seeded_heavy_adversarial_guard_fuzzing(tmp_path: Path) ->
         oct3 = rng.randint(0, 255)
         oct4 = rng.randint(1, 254)
         ip_int = (oct1 << 24) | (oct2 << 16) | (oct3 << 8) | oct4
+        ctrl = rng.choice(["\t", "\n", "\x00"])
         bad_url = rng.choice(
             [
                 f"http://{ip_int}/p",
@@ -324,7 +325,7 @@ def test_deterministic_seeded_heavy_adversarial_guard_fuzzing(tmp_path: Path) ->
                 f"http://[2002:{oct1:02x}{oct2:02x}:{oct3:02x}{oct4:02x}::]/p",
                 f"https://user:pass@public{i}.example.com/v1",
                 f"https://svc{i}.{rng.choice(['internal', 'local', 'corp', 'lan'])}/api",
-                f"https://public{i}.example.com{rng.choice(['\t', '\n', '\x00'])}/v1",
+                f"https://public{i}.example.com{ctrl}/v1",
             ]
         )
         with pytest.raises(ValueError):
