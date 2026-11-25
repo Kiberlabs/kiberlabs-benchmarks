@@ -504,3 +504,164 @@ def test_redteam_50_thread_concurrent_stress() -> None:
 
     assert len(results) == 50
     assert all(total >= 100 and bypassed == 0 and rate == 100.0 for total, bypassed, rate in results)
+
+
+class _BenchSpyConn:
+    def __init__(self, inner: sqlite3.Connection, sql_log: list[str], fail_hook: Any = None) -> None:
+        self._inner = inner
+        self._sql_log = sql_log
+        self._fail_hook = fail_hook
+        self.closed = False
+
+    @property
+    def row_factory(self) -> Any:
+        return self._inner.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value: Any) -> None:
+        self._inner.row_factory = value
+
+    def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        normalized = " ".join(sql.split()).rstrip(";").upper()
+        self._sql_log.append(normalized)
+        if self._fail_hook is not None:
+            self._fail_hook("execute", normalized)
+        return self._inner.execute(sql, *args, **kwargs)
+
+    def executescript(self, sql_script: str) -> sqlite3.Cursor:
+        self._sql_log.append("EXECUTESCRIPT")
+        if self._fail_hook is not None:
+            self._fail_hook("executescript", sql_script)
+        return self._inner.executescript(sql_script)
+
+    def commit(self) -> None:
+        self._inner.commit()
+
+    def close(self) -> None:
+        self.closed = True
+        self._inner.close()
+
+    def __enter__(self) -> _BenchSpyConn:
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> bool | None:
+        return self._inner.__exit__(*exc)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def test_replay_guard_pragma_order_and_skips_redundant_wal(monkeypatch: pytest.MonkeyPatch) -> None:
+    sql_log: list[str] = []
+    timeouts: list[object] = []
+    real_connect = sqlite3.connect
+
+    def spy_connect(*args: object, **kwargs: object) -> _BenchSpyConn:
+        timeouts.append(kwargs.get("timeout"))
+        return _BenchSpyConn(real_connect(*args, **kwargs), sql_log)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlite3, "connect", spy_connect)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "replay_pragma.db"
+        with ReplayGuard(db_path, secret_key=b"pragma-secret"):
+            assert timeouts == [5.0]
+            busy_idx = sql_log.index("PRAGMA BUSY_TIMEOUT=5000")
+            mode_idx = sql_log.index("PRAGMA JOURNAL_MODE")
+            wal_idx = sql_log.index("PRAGMA JOURNAL_MODE=WAL")
+            assert busy_idx < mode_idx < wal_idx
+
+        sql_log.clear()
+        with ReplayGuard(db_path, secret_key=b"pragma-secret"):
+            assert "PRAGMA BUSY_TIMEOUT=5000" in sql_log
+            assert "PRAGMA JOURNAL_MODE" in sql_log
+            assert "PRAGMA JOURNAL_MODE=WAL" not in sql_log
+
+    sql_log.clear()
+    with ReplayGuard(":memory:", secret_key=b"mem-secret") as mem_guard:
+        ts = 1_763_800_000
+        body = b'{"mem":true}'
+        assert mem_guard.verify_and_record("evt_mem_001", ts, body, mem_guard.sign(ts, body), now=ts)
+        assert "PRAGMA JOURNAL_MODE=WAL" not in sql_log
+
+
+def test_replay_guard_cold_start_retry_and_tempdir_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(time, "sleep", lambda _secs: None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "retry.db"
+        conns: list[_BenchSpyConn] = []
+        sql_log: list[str] = []
+
+        def flaky_wal_connect(*args: object, **kwargs: object) -> _BenchSpyConn:
+            attempt = len(conns) + 1
+
+            def fail_hook(kind: str, sql: str) -> None:
+                if kind == "execute" and sql == "PRAGMA JOURNAL_MODE=WAL" and attempt <= 2:
+                    raise sqlite3.OperationalError("database is locked")
+
+            spy = _BenchSpyConn(real_connect(*args, **kwargs), sql_log, fail_hook)  # type: ignore[arg-type]
+            conns.append(spy)
+            return spy
+
+        monkeypatch.setattr(sqlite3, "connect", flaky_wal_connect)
+        guard = ReplayGuard(db_path, secret_key=b"retry-secret")
+        assert len(conns) == 3
+        assert conns[0].closed and conns[1].closed
+        assert not conns[2].closed
+        ts = 1_763_800_000
+        body = b'{"ok":true}'
+        assert guard.verify_and_record("evt_retry_01", ts, body, guard.sign(ts, body), now=ts)
+        guard.close()
+        assert conns[2].closed
+
+    assert not tmp_dir.exists()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "always_locked.db"
+        conns = []
+        sql_log = []
+
+        def always_locked_connect(*args: object, **kwargs: object) -> _BenchSpyConn:
+            def fail_hook(kind: str, sql: str) -> None:
+                if kind == "execute" and sql == "PRAGMA JOURNAL_MODE=WAL":
+                    raise sqlite3.OperationalError("database is locked")
+
+            spy = _BenchSpyConn(real_connect(*args, **kwargs), sql_log, fail_hook)  # type: ignore[arg-type]
+            conns.append(spy)
+            return spy
+
+        monkeypatch.setattr(sqlite3, "connect", always_locked_connect)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            ReplayGuard(db_path, secret_key=b"fail-secret")
+        assert len(conns) == 6
+        assert all(c.closed for c in conns)
+
+    assert not tmp_dir.exists()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        db_path = tmp_dir / "non_lock.db"
+        conns = []
+        sql_log = []
+
+        def non_lock_connect(*args: object, **kwargs: object) -> _BenchSpyConn:
+            def fail_hook(kind: str, sql: str) -> None:
+                if kind == "execute" and sql == "PRAGMA JOURNAL_MODE=WAL":
+                    raise sqlite3.OperationalError("disk I/O error")
+
+            spy = _BenchSpyConn(real_connect(*args, **kwargs), sql_log, fail_hook)  # type: ignore[arg-type]
+            conns.append(spy)
+            return spy
+
+        monkeypatch.setattr(sqlite3, "connect", non_lock_connect)
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+            ReplayGuard(db_path, secret_key=b"io-secret")
+        assert len(conns) == 1
+        assert conns[0].closed
+
+    assert not tmp_dir.exists()

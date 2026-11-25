@@ -6,10 +6,12 @@ import hashlib
 import hmac
 import ipaddress
 import math
+import random
 import re
 import sqlite3
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -219,6 +221,22 @@ def sanitize_fts5_query(raw_query: str) -> str:
     return " ".join(f'"{tok}"' for tok in tokens)
 
 
+_SQLITE_OPEN_MAX_ATTEMPTS = 6
+
+
+def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _close_sqlite_conn(conn: sqlite3.Connection | None) -> None:
+    if conn is not None:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
 class ReplayGuard:
     """Atomic HMAC-SHA256 webhook signature, timestamp freshness, and SQLite WAL replay guard."""
 
@@ -229,20 +247,44 @@ class ReplayGuard:
         max_age_sec: int = 300,
         max_future_skew_sec: int = 60,
     ) -> None:
-        """Flow: initialize SQLite WAL seen_events table with busy_timeout=15000 for atomic event deduplication."""
+        """Flow: initialize SQLite WAL seen_events table with busy_timeout=5000 for atomic event deduplication."""
         self._secret = secret_key
         self._max_age = max_age_sec
         self._max_future = max_future_skew_sec
+        self._db_path = str(db_path)
+        if self._db_path != ":memory:":
+            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._closed = False
-        self._conn = sqlite3.connect(str(db_path), timeout=15.0, check_same_thread=False)
-        self._conn.execute("PRAGMA busy_timeout=15000")
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS seen_events (event_id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)"
-        )
-        self._conn.commit()
+        self._conn = self._open_connection()
+        self._finalizer = weakref.finalize(self, _close_sqlite_conn, self._conn)
+
+    def _open_connection(self) -> sqlite3.Connection:
+        for attempt in range(_SQLITE_OPEN_MAX_ATTEMPTS):
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = sqlite3.connect(self._db_path, timeout=5.0, check_same_thread=False)
+                conn.execute("PRAGMA busy_timeout=5000")
+                mode_row = conn.execute("PRAGMA journal_mode").fetchone()
+                mode = str(mode_row[0]).lower() if mode_row else ""
+                if mode not in ("wal", "memory"):
+                    conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS seen_events (event_id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)"
+                )
+                conn.commit()
+                return conn
+            except sqlite3.OperationalError as exc:
+                _close_sqlite_conn(conn)
+                if _is_transient_sqlite_error(exc) and attempt < _SQLITE_OPEN_MAX_ATTEMPTS - 1:
+                    time.sleep(min(0.2, 0.02 * (2 ** attempt)) + random.uniform(0.0, 0.02))
+                    continue
+                raise
+            except BaseException:
+                _close_sqlite_conn(conn)
+                raise
+        raise sqlite3.OperationalError("database is locked")
 
     def sign(self, timestamp: int, payload: bytes) -> str:
         """Flow: compute canonical sha256=<hex> HMAC signature over '<timestamp>.<payload>'."""
@@ -296,8 +338,9 @@ class ReplayGuard:
     def close(self) -> None:
         with self._lock:
             if not self._closed:
-                self._conn.close()
+                _close_sqlite_conn(self._conn)
                 self._closed = True
+                self._finalizer.detach()
 
     def __enter__(self) -> ReplayGuard:
         return self
