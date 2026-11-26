@@ -94,6 +94,16 @@ FTS5_SQLI_PAYLOADS: tuple[str, ...] = (
     '""',
     "   ",
     "---",
+    "[ISO-9001] CNC-402 OR *",
+    "[MAN-CNC402#sec-4.2] ; DROP TABLE manual_chunks;--",
+    "manual_id:MAN-CNC402 NEAR/5 overheat",
+    "[DIN-47100] NOT CNC-402",
+    "CNC-402 AND 1=1",
+    "\u202eTCELES * FROM manual_chunks",
+    "spindle\u200b OR 1=1",
+    "＇ OR ＇1＇=＇1",
+    "ＳＥＬＥＣＴ * FROM manual_chunks_fts",
+    "CNC-402 \u041eR E-404",
 )
 
 

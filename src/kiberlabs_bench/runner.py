@@ -119,12 +119,12 @@ def bench_lead_bot_nlu(count: int = 2_000) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="kl_bench_bot_") as tmp:
         conn = sqlite3.connect(str(Path(tmp) / "bot.db"), timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("CREATE TABLE webhook_dedup (msg_id TEXT PRIMARY KEY, state TEXT NOT NULL)")
-        conn.commit()
         try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("CREATE TABLE webhook_dedup (msg_id TEXT PRIMARY KEY, state TEXT NOT NULL)")
+            conn.commit()
             t_wall0 = time.perf_counter_ns()
             for i in range(count):
                 msg = messages[i % len(messages)]
@@ -176,27 +176,27 @@ def bench_rag_fts5_bm25(doc_count: int = 200, query_count: int = 1_000) -> dict[
 
     with tempfile.TemporaryDirectory(prefix="kl_bench_rag_") as tmp:
         conn = sqlite3.connect(str(Path(tmp) / "rag.db"), timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("CREATE VIRTUAL TABLE docs_fts USING fts5(doc_id UNINDEXED, article, body, sha256 UNINDEXED)")
-
-        seed_articles = (
-            ("REG-GDPR-ART33", "Article 33", "Personal data breach notification to supervisory authority within 72 hours."),
-            ("NORM-ES-FACTURA", "Articulo 29", "Conservacion obligatoria de facturas electronicas durante plazo legal de 6 años."),
-            ("ADR-001-WAL", "Section 1", "SQLite WAL journal mode with busy timeout 5000 eliminates concurrent read write lock contention."),
-            ("ADR-003-HMAC", "Section 3", "FastAPI gateway enforces HMAC API key constant time verification and rate limiting."),
-        )
-        rows = []
-        for idx in range(doc_count):
-            doc_id, article, body = seed_articles[idx % len(seed_articles)]
-            full_body = f"{body} Clause revision {idx}."
-            digest = hashlib.sha256(full_body.encode("utf-8")).hexdigest()[:16]
-            rows.append((f"{doc_id}-{idx:03d}", article, full_body, digest))
-        conn.executemany("INSERT INTO docs_fts (doc_id, article, body, sha256) VALUES (?, ?, ?, ?)", rows)
-        conn.commit()
-
         try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("CREATE VIRTUAL TABLE docs_fts USING fts5(doc_id UNINDEXED, article, body, sha256 UNINDEXED)")
+
+            seed_articles = (
+                ("REG-GDPR-ART33", "Article 33", "Personal data breach notification to supervisory authority within 72 hours."),
+                ("NORM-ES-FACTURA", "Articulo 29", "Conservacion obligatoria de facturas electronicas durante plazo legal de 6 años."),
+                ("ADR-001-WAL", "Section 1", "SQLite WAL journal mode with busy timeout 5000 eliminates concurrent read write lock contention."),
+                ("ADR-003-HMAC", "Section 3", "FastAPI gateway enforces HMAC API key constant time verification and rate limiting."),
+            )
+            rows = []
+            for idx in range(doc_count):
+                doc_id, article, body = seed_articles[idx % len(seed_articles)]
+                full_body = f"{body} Clause revision {idx}."
+                digest = hashlib.sha256(full_body.encode("utf-8")).hexdigest()[:16]
+                rows.append((f"{doc_id}-{idx:03d}", article, full_body, digest))
+            conn.executemany("INSERT INTO docs_fts (doc_id, article, body, sha256) VALUES (?, ?, ?, ?)", rows)
+            conn.commit()
+
             t_wall0 = time.perf_counter_ns()
             for i in range(query_count):
                 raw_q = queries[i % len(queries)]
@@ -283,14 +283,16 @@ def bench_sqlite_wal_concurrency(workers: int = 50, ops_per_worker: int = 40) ->
     with tempfile.TemporaryDirectory(prefix="kl_bench_wal_") as tmp:
         db_path = Path(tmp) / "concurrent_wal.db"
         init_conn = sqlite3.connect(str(db_path), timeout=5.0)
-        init_conn.execute("PRAGMA journal_mode=WAL")
-        init_conn.execute("PRAGMA synchronous=NORMAL")
-        init_conn.execute("PRAGMA busy_timeout=5000")
-        init_conn.execute(
-            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, worker_id INTEGER NOT NULL, seq INTEGER NOT NULL, payload TEXT NOT NULL)"
-        )
-        init_conn.commit()
-        init_conn.close()
+        try:
+            init_conn.execute("PRAGMA busy_timeout=5000")
+            init_conn.execute("PRAGMA journal_mode=WAL")
+            init_conn.execute("PRAGMA synchronous=NORMAL")
+            init_conn.execute(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, worker_id INTEGER NOT NULL, seq INTEGER NOT NULL, payload TEXT NOT NULL)"
+            )
+            init_conn.commit()
+        finally:
+            init_conn.close()
 
         barrier = threading.Barrier(workers)
 
@@ -300,9 +302,9 @@ def bench_sqlite_wal_concurrency(workers: int = 50, ops_per_worker: int = 40) ->
             local_writes = 0
             local_reads = 0
             conn = sqlite3.connect(str(db_path), timeout=30.0)
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("PRAGMA synchronous=NORMAL")
             try:
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute("PRAGMA synchronous=NORMAL")
                 barrier.wait()
                 for seq in range(ops_per_worker):
                     t0 = time.perf_counter_ns()
@@ -342,10 +344,13 @@ def bench_sqlite_wal_concurrency(workers: int = 50, ops_per_worker: int = 40) ->
                     reads_done += r
         wall_ns = time.perf_counter_ns() - t_wall0
 
-        verify_conn = sqlite3.connect(str(db_path))
-        persisted_rows = int(verify_conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
-        journal_mode = str(verify_conn.execute("PRAGMA journal_mode").fetchone()[0]).upper()
-        verify_conn.close()
+        verify_conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            verify_conn.execute("PRAGMA busy_timeout=5000")
+            persisted_rows = int(verify_conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+            journal_mode = str(verify_conn.execute("PRAGMA journal_mode").fetchone()[0]).upper()
+        finally:
+            verify_conn.close()
 
     stats = compute_latency_stats(all_samples_ns, wall_ns)
     return {
@@ -365,14 +370,239 @@ def bench_sqlite_wal_concurrency(workers: int = 50, ops_per_worker: int = 40) ->
     }
 
 
+def bench_maintenance_rag_fts5(doc_count: int = 120, query_count: int = 1_000) -> dict[str, Any]:
+    """Flow: benchmark Repo #08 (telegram-maintenance-rag-bot) FTS5 manual retrieval p50/p95/p99 latency and abstention."""
+    queries = (
+        ("CNC-402", "E-404", "CNC-402 E-404 spindle overheat"),
+        ("PUMP-104", "ERR-209", "PUMP-104 ERR-209 cavitacion presion"),
+        ("HVAC-210", "ALM-312", "HVAC-210 ALM-312 refrigerant pressure"),
+        ("PLC-308", "FLT-108", "PLC-308 FLT-108 module bus timeout"),
+        ("TURB-999", "ERR-901", "TURB-999 ERR-901 bearing vibration"),  # abstention control
+    )
+    grounded = 0
+    abstained = 0
+    samples_ns: list[int] = []
+
+    with tempfile.TemporaryDirectory(prefix="kl_bench_maint_rag_") as tmp:
+        conn = sqlite3.connect(str(Path(tmp) / "maint_rag.db"), timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.executescript(
+                """
+                CREATE TABLE manual_chunks (
+                    chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manual_id TEXT NOT NULL,
+                    section TEXT NOT NULL,
+                    equipment_model TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    UNIQUE(manual_id, section)
+                );
+                CREATE VIRTUAL TABLE manual_chunks_fts USING fts5(
+                    manual_id,
+                    section,
+                    equipment_model,
+                    content,
+                    content='manual_chunks',
+                    content_rowid='chunk_id',
+                    tokenize='unicode61 remove_diacritics 2'
+                );
+                CREATE TRIGGER manual_chunks_ai AFTER INSERT ON manual_chunks BEGIN
+                    INSERT INTO manual_chunks_fts(rowid, manual_id, section, equipment_model, content)
+                    VALUES (new.chunk_id, new.manual_id, new.section, new.equipment_model, new.content);
+                END;
+                """
+            )
+            seed_manuals = (
+                ("MAN-CNC402", "sec-4.2", "CNC-402", "ISO-9001 Fault E-404 Spindle Overheat: stop feed, verify coolant flow >= 12 L/min."),
+                ("MAN-PUMP104", "sec-2.3", "PUMP-104", "IEC-60204 Fallo ERR-209 Cavitacion y caida de presion: purgar valvula y revisar filtro."),
+                ("MAN-HVAC210", "sec-3.1", "HVAC-210", "DIN-47100 Alarm ALM-312 Refrigerant Pressure: check condenser breaker F2 and 14-18 bar."),
+                ("MAN-PLC308", "sec-1.8", "PLC-308", "Fault FLT-108 Module Bus Timeout: verify Profibus termination and 24V DC rail."),
+            )
+            rows = []
+            for idx in range(doc_count):
+                man_id, sec, model, body = seed_manuals[idx % len(seed_manuals)]
+                rows.append((f"{man_id}-{idx:03d}", sec, model, f"{body} Revision {idx}."))
+            conn.executemany(
+                "INSERT INTO manual_chunks (manual_id, section, equipment_model, content) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+
+            t_wall0 = time.perf_counter_ns()
+            for i in range(query_count):
+                eq_id, fault_code, raw_q = queries[i % len(queries)]
+                t0 = time.perf_counter_ns()
+                safe_q = sanitize_fts5_query(raw_q)
+                hits = conn.execute(
+                    """
+                    SELECT c.chunk_id, c.manual_id, c.section, c.equipment_model, c.content,
+                           bm25(manual_chunks_fts, 1.0, 1.5, 2.0, 1.0) AS score
+                    FROM manual_chunks_fts
+                    JOIN manual_chunks AS c ON c.chunk_id = manual_chunks_fts.rowid
+                    WHERE manual_chunks_fts MATCH ?
+                    ORDER BY score ASC, c.chunk_id ASC
+                    LIMIT 5
+                    """,
+                    (safe_q,),
+                ).fetchall()
+                scoped = [
+                    h
+                    for h in hits
+                    if h[3] == eq_id and fault_code.lower() in h[4].lower()
+                ]
+                if scoped:
+                    grounded += 1
+                else:
+                    abstained += 1
+                samples_ns.append(time.perf_counter_ns() - t0)
+            wall_ns = time.perf_counter_ns() - t_wall0
+        finally:
+            conn.close()
+
+    stats = compute_latency_stats(samples_ns, wall_ns)
+    return {
+        "id": "maintenance_rag_fts5",
+        "name": "Telegram Maintenance Manual FTS5 RAG",
+        "unit": "queries/sec",
+        **stats,
+        "details": {
+            "manual_chunks": doc_count,
+            "grounded": grounded,
+            "abstained": abstained,
+            "llm_tokens_used": 0,
+        },
+    }
+
+
+def bench_maintenance_update_id_wal(workers: int = 16, ops_per_worker: int = 40) -> dict[str, Any]:
+    """Flow: stress 16 concurrent threads inserting 64-bit Telegram update_ids into SQLite WAL with atomic dedup."""
+    samples_lock = threading.Lock()
+    all_samples_ns: list[int] = []
+    lock_errors = 0
+    inserted_unique = 0
+    duplicates_blocked = 0
+    base_uid = (1 << 61) + 700_000
+
+    with tempfile.TemporaryDirectory(prefix="kl_bench_maint_wal_") as tmp:
+        db_path = Path(tmp) / "maint_wal.db"
+        init_conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            init_conn.execute("PRAGMA busy_timeout=5000")
+            init_conn.execute("PRAGMA journal_mode=WAL")
+            init_conn.execute("PRAGMA synchronous=NORMAL")
+            init_conn.execute(
+                """
+                CREATE TABLE maintenance_logs (
+                    update_id INTEGER PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    equipment_id TEXT NOT NULL,
+                    fault_code TEXT NOT NULL
+                )
+                """
+            )
+            init_conn.commit()
+        finally:
+            init_conn.close()
+
+        barrier = threading.Barrier(workers)
+
+        def _worker(wid: int) -> tuple[list[int], int, int, int]:
+            local_samples: list[int] = []
+            local_locks = 0
+            local_inserted = 0
+            local_dups = 0
+            conn = sqlite3.connect(str(db_path), timeout=5.0, isolation_level=None)
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                barrier.wait()
+                for seq in range(ops_per_worker):
+                    # Mix unique 64-bit update_ids (75%) with shared replay update_ids (25%)
+                    if seq % 4 == 3:
+                        uid = base_uid + (seq // 4)
+                    else:
+                        uid = base_uid + 10_000 + (wid * ops_per_worker) + seq
+                    t0 = time.perf_counter_ns()
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        cur = conn.execute(
+                            """
+                            INSERT INTO maintenance_logs (update_id, chat_id, equipment_id, fault_code)
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT(update_id) DO NOTHING
+                            """,
+                            (uid, -1001234567890, f"CNC-{400 + (wid % 8)}", f"E-{400 + (seq % 10)}"),
+                        )
+                        conn.execute("COMMIT")
+                        if cur.rowcount > 0:
+                            local_inserted += 1
+                        else:
+                            local_dups += 1
+                    except sqlite3.OperationalError as exc:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            pass
+                        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                            local_locks += 1
+                        else:
+                            raise
+                    local_samples.append(time.perf_counter_ns() - t0)
+            finally:
+                conn.close()
+            return local_samples, local_locks, local_inserted, local_dups
+
+        t_wall0 = time.perf_counter_ns()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_worker, wid) for wid in range(workers)]
+            for fut in futures:
+                s, errs, ins, dups = fut.result()
+                with samples_lock:
+                    all_samples_ns.extend(s)
+                    lock_errors += errs
+                    inserted_unique += ins
+                    duplicates_blocked += dups
+        wall_ns = time.perf_counter_ns() - t_wall0
+
+        verify_conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            verify_conn.execute("PRAGMA busy_timeout=5000")
+            persisted_rows = int(verify_conn.execute("SELECT COUNT(*) FROM maintenance_logs").fetchone()[0])
+            journal_mode = str(verify_conn.execute("PRAGMA journal_mode").fetchone()[0]).upper()
+        finally:
+            verify_conn.close()
+
+    stats = compute_latency_stats(all_samples_ns, wall_ns)
+    return {
+        "id": "maintenance_update_id_wal",
+        "name": "Telegram 64-bit update_id 16-Thread WAL",
+        "unit": "ops/sec",
+        **stats,
+        "details": {
+            "concurrent_threads": workers,
+            "ops_per_thread": ops_per_worker,
+            "inserted_unique": inserted_unique,
+            "duplicates_blocked": duplicates_blocked,
+            "persisted_rows": persisted_rows,
+            "journal_mode": journal_mode,
+            "lock_errors": lock_errors,
+            "max_update_id_bits": 62,
+        },
+    }
+
+
 def run_all_benchmarks() -> dict[str, Any]:
-    """Flow: execute all 5 core performance/concurrency benchmarks plus the 100+ payload Red-Team suite and return JSON report."""
+    """Flow: execute all 7 performance/concurrency benchmarks plus the 100+ payload Red-Team suite and return JSON report."""
     benchmarks = [
         bench_margin_sieve(),
         bench_lead_bot_nlu(),
         bench_rag_fts5_bm25(),
         bench_gateway_auth_ratelimit(),
         bench_sqlite_wal_concurrency(),
+        bench_maintenance_rag_fts5(),
+        bench_maintenance_update_id_wal(),
     ]
     redteam = run_redteam_suite()
     return {
@@ -413,6 +643,8 @@ def render_markdown_report(report: dict[str, Any]) -> str:
 
     wal = next(b for b in report["benchmarks"] if b["id"] == "sqlite_wal_concurrency")
     wd = wal["details"]
+    mwal = next(b for b in report["benchmarks"] if b["id"] == "maintenance_update_id_wal")
+    mwd = mwal["details"]
     lines.extend(
         [
             "",
@@ -420,6 +652,11 @@ def render_markdown_report(report: dict[str, Any]) -> str:
             f"`{wd['writes_committed']:,}` writes + `{wd['reads_completed']:,}` reads, "
             f"`{wd['persisted_rows']:,}` persisted rows, journal mode `{wd['journal_mode']}`, "
             f"**`{wd['lock_errors']}` `database is locked` errors**.",
+            "",
+            f"**Maintenance 64-bit `update_id` WAL Verification:** `{mwd['concurrent_threads']}` concurrent threads, "
+            f"`{mwd['inserted_unique']:,}` unique inserts + `{mwd['duplicates_blocked']:,}` duplicate replays blocked, "
+            f"`{mwd['persisted_rows']:,}` persisted rows, journal mode `{mwd['journal_mode']}`, "
+            f"**`{mwd['lock_errors']}` `database is locked` errors**.",
             "",
             "## 2. Adversarial Red-Team Security Suite",
             "",

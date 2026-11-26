@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import ast
 import json
 import math
 import random
@@ -25,6 +26,8 @@ from kiberlabs_bench.guards import (
 from kiberlabs_bench.runner import (
     bench_gateway_auth_ratelimit,
     bench_lead_bot_nlu,
+    bench_maintenance_rag_fts5,
+    bench_maintenance_update_id_wal,
     bench_margin_sieve,
     bench_rag_fts5_bm25,
     bench_sqlite_wal_concurrency,
@@ -116,12 +119,14 @@ def test_cli_generates_json_and_markdown_reports(tmp_path: Path) -> None:
     assert md_out.exists()
 
     data = json.loads(json_out.read_text(encoding="utf-8"))
-    assert len(data["benchmarks"]) == 5
-    assert data["redteam"]["total_payloads"] >= 100
+    assert len(data["benchmarks"]) == 7
+    assert data["redteam"]["total_payloads"] >= 120
     assert data["redteam"]["bypassed_count"] == 0
 
     md_text = md_out.read_text(encoding="utf-8")
     assert "SQLite WAL 50-Thread Concurrency" in md_text
+    assert "Telegram Maintenance Manual FTS5 RAG" in md_text
+    assert "Telegram 64-bit update_id 16-Thread WAL" in md_text
     assert "`0` `database is locked` errors" in md_text
     assert render_markdown_report(data) == md_text
 
@@ -665,3 +670,72 @@ def test_replay_guard_cold_start_retry_and_tempdir_cleanup(monkeypatch: pytest.M
         assert conns[0].closed
 
     assert not tmp_dir.exists()
+
+
+def test_maintenance_rag_fts5_latency_and_abstention() -> None:
+    """Flow: verify Repo #08 FTS5 manual RAG benchmark produces valid percentiles and deliberate abstention."""
+    res = bench_maintenance_rag_fts5(doc_count=20, query_count=50)
+    assert res["id"] == "maintenance_rag_fts5"
+    assert res["ops_per_sec"] > 0
+    assert 0 <= res["min_ms"] <= res["p50_ms"] <= res["p95_ms"] <= res["p99_ms"] <= res["max_ms"]
+    assert res["details"]["grounded"] == 40
+    assert res["details"]["abstained"] == 10
+    assert res["details"]["llm_tokens_used"] == 0
+
+
+def test_maintenance_update_id_16_thread_wal_concurrency() -> None:
+    """Flow: verify 16-thread 64-bit update_id SQLite WAL concurrency has 0 lock errors and accurate dedup."""
+    res = bench_maintenance_update_id_wal(workers=16, ops_per_worker=16)
+    details = res["details"]
+    assert res["id"] == "maintenance_update_id_wal"
+    assert details["concurrent_threads"] == 16
+    assert details["journal_mode"] == "WAL"
+    assert details["lock_errors"] == 0
+    assert details["max_update_id_bits"] == 62
+    assert details["inserted_unique"] == details["persisted_rows"]
+    assert details["duplicates_blocked"] > 0
+    assert details["inserted_unique"] + details["duplicates_blocked"] == 16 * 16
+
+
+def test_redteam_fts5_unicode_and_norm_tag_payloads() -> None:
+    """Flow: verify FTS5-operator, Unicode homoglyph/format, and norm-tag spoofing payloads are blocked."""
+    for benign in ("CNC-402 E-404 spindle overheat", "PUMP-104 ERR-209 cavitación presión"):
+        sanitized = sanitize_fts5_query(benign)
+        assert sanitized.startswith('"')
+
+    adversarial = (
+        "[ISO-9001] CNC-402 OR *",
+        "[MAN-CNC402#sec-4.2] ; DROP TABLE manual_chunks;--",
+        "manual_id:MAN-CNC402 NEAR/5 overheat",
+        "\u202eTCELES * FROM manual_chunks",
+        "spindle\u200b OR 1=1",
+        "＇ OR ＇1＇=＇1",
+        "ＳＥＬＥＣＴ * FROM manual_chunks_fts",
+        "CNC-402 \u041eR E-404",
+        "O\u0301R",
+        "CNC-402 O\u0301R E-404",
+    )
+    for payload in adversarial:
+        with pytest.raises(ValueError):
+            sanitize_fts5_query(payload)
+
+
+def test_runner_pragma_order_and_python311_ast_compatibility() -> None:
+    """Flow: verify busy_timeout=5000 precedes journal_mode=WAL and all files satisfy Python 3.11 AST rules."""
+    bench_root = Path(__file__).resolve().parents[1]
+    runner_src = (bench_root / "src" / "kiberlabs_bench" / "runner.py").read_text(encoding="utf-8")
+    for line_idx, line in enumerate(runner_src.splitlines()):
+        if "PRAGMA journal_mode=WAL" in line:
+            window = "\n".join(runner_src.splitlines()[max(0, line_idx - 5) : line_idx])
+            assert "PRAGMA busy_timeout=5000" in window
+
+    for py_file in (*sorted((bench_root / "src").rglob("*.py")), *sorted((bench_root / "tests").rglob("*.py"))):
+        src = py_file.read_text(encoding="utf-8")
+        tree = ast.parse(src, filename=str(py_file))
+        assert "from __future__ import annotations" in src, f"Missing future annotations in {py_file}"
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                for val in node.values:
+                    if isinstance(val, ast.FormattedValue):
+                        segment = ast.get_source_segment(src, val) or ""
+                        assert "\\" not in segment, f"PEP 701 backslash in f-string expr in {py_file}: {segment}"

@@ -11,6 +11,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import weakref
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,7 @@ _HOST_CHARS_RE = re.compile(r"^[a-z0-9.-]+$")
 _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _SKU_ID_RE = re.compile(r"^[A-Za-z0-9._-]{2,64}$")
 
-_FTS_FORBIDDEN_CHARS_RE = re.compile(r"[\x00-\x1f\x7f'\"`;*^:(){}=\\]|--|/\*|\*/")
+_FTS_FORBIDDEN_CHARS_RE = re.compile(r"[\x00-\x1f\x7f'\"`;*^:(){}=\\\[\]#]|--|/\*|\*/")
 _FTS_FORBIDDEN_KEYWORDS_RE = re.compile(
     r"\b(?:OR|NOT|NEAR|SELECT|UNION|DROP|DELETE|INSERT|UPDATE|ATTACH|PRAGMA|SQLITE_MASTER|(?i:sqlite_master))\b"
 )
@@ -193,19 +194,27 @@ def validate_safe_path(base_dir: Path, untrusted_path: str) -> Path:
 
 
 def sanitize_fts5_query(raw_query: str) -> str:
-    """Flow: reject SQL/FTS5 injection operators and control syntax, then return strictly quoted safe FTS5 terms."""
+    """Flow: reject SQL/FTS5 injection operators, Unicode format/homoglyph tricks, and control syntax, then return quoted safe FTS5 terms."""
     if not isinstance(raw_query, str) or not raw_query.strip() or len(raw_query) > 256:
         raise ValueError("Invalid FTS5 query input")
-    if _FTS_FORBIDDEN_CHARS_RE.search(raw_query):
+    if any(unicodedata.category(ch) == "Cf" for ch in raw_query):
+        raise ValueError("Forbidden invisible Unicode format character detected")
+    normalized = unicodedata.normalize("NFKC", raw_query)
+    if any(ch.isalpha() and ord(ch) > 0x024F for ch in normalized):
+        raise ValueError("Forbidden non-Latin homoglyph character detected")
+    if _FTS_FORBIDDEN_CHARS_RE.search(normalized):
         raise ValueError("Forbidden SQL/FTS5 syntax character detected")
-    if _FTS_FORBIDDEN_KEYWORDS_RE.search(raw_query):
+    folded_for_kw = "".join(
+        ch for ch in unicodedata.normalize("NFKD", normalized) if unicodedata.category(ch) != "Mn"
+    )
+    if _FTS_FORBIDDEN_KEYWORDS_RE.search(normalized) or _FTS_FORBIDDEN_KEYWORDS_RE.search(folded_for_kw):
         raise ValueError("Forbidden SQL/FTS5 operator keyword detected")
 
-    all_tokens = _FTS_TOKEN_RE.findall(raw_query)
+    all_tokens = _FTS_TOKEN_RE.findall(normalized)
     if not all_tokens:
         raise ValueError("Query contains no valid searchable tokens")
-    if re.search(r"\bAND\b", raw_query):
-        if any(ch.islower() for ch in raw_query):
+    if re.search(r"\bAND\b", normalized):
+        if any(ch.islower() for ch in normalized):
             raise ValueError("Forbidden SQL/FTS5 operator keyword detected")
         for idx, tok in enumerate(all_tokens):
             if tok == "AND":
